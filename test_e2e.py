@@ -157,7 +157,10 @@ def test_normalize_url():
         normalize_url("https://example.com/path?q=1&r=2#section")
         == "https://example.com/path"
     )
-    assert normalize_url("https://example.com/path/#frag") == "https://example.com/path"
+    assert (
+        normalize_url("https://example.com/path/#frag")
+        == "https://example.com/path"
+    )
     print("\nnormalize_url 测试通过!")
 
 
@@ -260,7 +263,9 @@ async def _test_dedup():
     stop_event.set()
     sub_thread.join(timeout=5)
 
-    assert len(received) == 3, f"subscriber 应只收到 3 条 (实际 {len(received)})"
+    assert (
+        len(received) == 3
+    ), f"subscriber 应只收到 3 条 (实际 {len(received)})"
 
     client.delete(dedup_set)
     client.close()
