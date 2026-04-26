@@ -1,0 +1,22 @@
+[logging]
+level = "INFO"
+
+[redis]
+host = "localhost"
+port = 6379
+db = 0
+password = ""
+channel = "news"
+dedup-set = "base-life:published"
+
+[[sources]]
+name = "daringfireball"
+url = "https://daringfireball.net/archive/"
+
+[sources.selectors]
+list_selector = "div.archive p > a"
+title = "h1"
+pub = "h6.dateline"
+pub-format = "%d %B %Y"
+content = "div.article"
+search = ["MacBook Neo"]

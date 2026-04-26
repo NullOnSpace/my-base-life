@@ -1,0 +1,32 @@
+[project]
+name = "my-base-life"
+version = "0.1.0"
+description = "Fetch news via base-life, filter, format as markdown, and publish to Redis"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "base-life",
+    "redis",
+]
+
+[project.scripts]
+my-base-life = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["main.py"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv.sources]
+base-life = { git = "https://github.com/NullOnSpace/base-life" }
