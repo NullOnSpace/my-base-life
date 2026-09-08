@@ -24,6 +24,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout canonical-msg (push.v1 契约 gen/)
+        uses: actions/checkout@v4
+        with:
+          repository: NullOnSpace/canonical-msg
+          path: canonical-msg
+
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
@@ -36,4 +42,6 @@ jobs:
         run: uv sync
 
       - name: Run tests
+        env:
+          CANONICAL_MSG_GEN_PATH: ${{ github.workspace }}/canonical-msg/gen/python
         run: uv run pytest test_e2e.py -v
