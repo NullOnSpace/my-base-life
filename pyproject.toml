@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "base-life",
+    "protobuf>=7.36.1",
+    "python-ulid>=4.0.1",
     "redis",
 ]
 
