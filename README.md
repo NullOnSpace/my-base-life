@@ -4,15 +4,15 @@
 [![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-基于 [base-life](https://github.com/NullOnSpace/base-life) 的新闻聚合与发布工具。从配置的新闻源抓取文章，按关键词过滤，格式化为 Markdown，并通过 Redis Pub/Sub 发布。
+基于 [base-life](https://github.com/NullOnSpace/base-life) 的新闻聚合与发布工具（消息推送分层架构的 **A 层**信源接入，总设计见 `~/rust-projects/push-architecture/DESIGN.md`）。从配置的新闻源抓取文章，按关键词过滤（D2：选题属 A），构造 [canonical-msg](~/rust-projects/push-architecture/canonical-msg) 仓库定义的 `push.v1` canonical 消息，通过 Redis Pub/Sub 发布到 `msgs.in`。
 
 ## 功能特性
 
 - **多源抓取**：支持配置多个新闻源，自动解析列表页和详情页
-- **关键词过滤**：按搜索词筛选匹配的文章
-- **Markdown 格式化**：将新闻转换为结构化的 Markdown 文本
-- **Redis Pub/Sub 发布**：将格式化后的新闻推送到指定频道
-- **URL 去重**：基于 Redis Set 的去重机制，避免重复发布
+- **关键词过滤**：按搜索词筛选匹配的文章（命中词写入 `tags`，可观测、可迁移）
+- **canonical 消息**：输出 push.v1 CanonicalMessage（protobuf bytes），不做终端格式化（Markdown 渲染移交 render-hub）
+- **Redis Pub/Sub 发布**：将 canonical 消息推送到 `msgs.in` 频道
+- **URL 去重**：基于 Redis Set 的去重机制，**只记已发布 URL**，避免重复发布
 - **URL 标准化**：自动去除查询字符串、片段标识符和尾部斜杠
 
 ## 依赖
@@ -77,8 +77,8 @@ host = "localhost"           # Redis 服务器地址
 port = 6379                  # Redis 端口
 db = 0                       # Redis 数据库编号
 password = ""                # 密码（留空表示无密码）
-channel = "news"             # 发布频道名称
-dedup-set = "base-life:published"  # 去重集合名称
+canonical-channel = "msgs.in"  # push.v1 canonical 消息发布目标（canonical-msg 契约）
+dedup-set = "base-life:published"  # 去重集合（只记已发布 URL）
 ```
 
 ### 新闻源配置
@@ -114,26 +114,40 @@ search = ["MacBook Neo"]              # 搜索关键词（可选）
 | `%b` | 缩写月份名 | Jan |
 | `%p` | AM/PM | AM, PM |
 
+## 消息契约（canonical-msg）
+
+发布载荷为 `push.v1.CanonicalMessage`（protobuf），契约单一事实源在 `~/rust-projects/push-architecture/canonical-msg` 仓库（proto 定义 + 双语言生成代码 + 契约测试）。Python 侧由 `canonical_msg.py` 接入其 `gen/python` 生成代码，路径解析顺序：
+
+1. 环境变量 `CANONICAL_MSG_GEN_PATH`（绝对路径，指向含 `push/` 包的目录）
+2. 默认：canonical-msg checkout 的 `gen/python`（本机开发布局）
+
+`gen/` 的任何改动必须经 canonical-msg 的 `scripts/gen_python.sh` 再生成，禁止手改。
+
 ## 订阅新闻
 
-使用 Redis 客户端订阅发布的新闻：
+发布的载荷是 canonical 消息（protobuf bytes），可用 canonical-msg 的 `sub_dump` 观察工具查看（protojson，Timestamp 为 RFC3339）：
+
+```bash
+cd ~/rust-projects/push-architecture/canonical-msg
+cargo run --release --example sub_dump -- --channel msgs.in
+```
+
+或使用 Redis 客户端订阅并解码：
 
 ```python
+import sys
+sys.path.insert(0, "/path/to/canonical-msg/gen/python")  # 或设 CANONICAL_MSG_GEN_PATH
 import redis
+from push.v1 import canonical_pb2
 
 client = redis.Redis(host="localhost", port=6379, db=0)
 pubsub = client.pubsub()
-pubsub.subscribe("news")
+pubsub.subscribe("msgs.in")
 
 for message in pubsub.listen():
     if message["type"] == "message":
-        print(message["data"].decode("utf-8"))
-```
-
-或使用 `redis-cli`：
-
-```bash
-redis-cli SUBSCRIBE news
+        msg = canonical_pb2.CanonicalMessage.FromString(message["data"])
+        print(msg.title, msg.body_markdown)
 ```
 
 ## 开发
@@ -150,7 +164,8 @@ uv run pytest test_e2e.py -v
 
 ```
 my-base-life/
-├── main.py              # 主程序入口
+├── main.py              # 主程序入口（抓取→过滤→canonical 构造→Redis 发布）
+├── canonical_msg.py     # push.v1 canonical 构造（build_canonical / matched_keywords）
 ├── config.example.toml  # 示例配置
 ├── config.toml          # 用户配置（gitignore）
 ├── test_e2e.py          # E2E 测试
