@@ -1,3 +1,15 @@
+"""my-base-life：A 层爬虫信源接入（编排 base-life 库）。
+
+旧 Markdown 模板（已随 Phase 1 从发布路径移除，Phase 3 由 render-hub 的
+NEWS 渲染器按此版式复用，渲染效果不变）：
+
+    ## {title}
+    **来源**: {source}  |  **发布时间**: {pub}
+    **链接**: {url}
+
+    {content}
+"""
+
 import asyncio
 import logging
 import sys
@@ -11,6 +23,7 @@ from base_life.scraper import (
     setup_logging,
     unfiltered_items,
 )
+from canonical_msg import build_canonical, matched_keywords, protojson
 
 
 def load_config(path: str) -> dict:
@@ -30,34 +43,24 @@ def normalize_url(url: str) -> str:
     return parsed._replace(query="", fragment="").geturl().rstrip("/")
 
 
-def format_news_item(item) -> str:
-    lines = []
-    if item.title:
-        lines.append(f"## {item.title}")
-    else:
-        lines.append("## [无标题]")
-    lines.append("")
-    meta = f"**来源**: {item.source}"
-    if item.pub:
-        meta += f"  |  **发布时间**: {item.pub}"
-    lines.append(meta)
-    lines.append("")
-    lines.append(f"**链接**: {item.url}")
-    lines.append("")
-    if item.content:
-        lines.append(item.content.strip())
-    lines.append("")
-    return "\n".join(lines)
-
-
 async def publish_to_redis(config: dict, items: list) -> int:
     redis_conf = config.get("redis", {})
     host = redis_conf.get("host", "localhost")
     port = redis_conf.get("port", 6379)
     db = redis_conf.get("db", 0)
     password = redis_conf.get("password") or None
-    channel = redis_conf.get("channel", "news")
+    channel = redis_conf.get("canonical-channel", "msgs.in")
     dedup_set = redis_conf.get("dedup-set", "base-life:published")
+
+    if redis_conf.get("channel"):
+        logging.warning(
+            "redis.channel 已弃用且被忽略，发布目标为 canonical-channel"
+        )
+
+    source_selectors = {
+        src.get("name"): src.get("selectors", {})
+        for src in config.get("sources", [])
+    }
 
     client = aioredis.Redis(host=host, port=port, db=db, password=password)
     try:
@@ -71,10 +74,20 @@ async def publish_to_redis(config: dict, items: list) -> int:
         for i, item in enumerate(items):
             if exists[i]:
                 continue
-            msg = format_news_item(item)
-            pipe.publish(channel, msg)
+            try:
+                msg = build_canonical(
+                    item,
+                    matched_keywords(
+                        item, source_selectors.get(item.source, {})
+                    ),
+                )
+            except Exception:
+                logging.exception("canonical 构造失败，跳过该条: %s", item.url)
+                continue
+            pipe.publish(channel, msg.SerializeToString())
             pipe.sadd(dedup_set, normalize_url(item.url))
             count += 1
+            logging.debug("canonical %s", protojson(msg))
         if count:
             await pipe.execute()
         return count
@@ -104,7 +117,7 @@ async def run(config_path: str):
         return
 
     count = await publish_to_redis(config, matched)
-    logging.info("已发布 %d 条新闻到 Redis channel（去重后）。", count)
+    logging.info("已发布 %d 条 canonical 消息到 Redis（去重后）。", count)
 
 
 def main():

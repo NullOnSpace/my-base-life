@@ -6,8 +6,8 @@ host = "localhost"
 port = 6379
 db = 0
 password = ""
-channel = "news"
-dedup-set = "base-life:published"
+canonical-channel = "msgs.in"  # push.v1 canonical 消息发布目标（canonical-msg 契约）
+dedup-set = "base-life:published"  # 去重集合（只记已发布 URL）
 
 [[sources]]
 name = "daringfireball"
