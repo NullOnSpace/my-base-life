@@ -1,7 +1,7 @@
 [project]
 name = "my-base-life"
 version = "0.1.0"
-description = "Fetch news via base-life, filter, format as markdown, and publish to Redis"
+description = "Fetch news via base-life, filter by keywords, build push.v1 canonical messages, and publish to Redis"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
