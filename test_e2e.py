@@ -4,6 +4,7 @@ import time
 import uuid
 
 
+import pytest
 import redis
 from bs4 import BeautifulSoup
 
@@ -13,14 +14,14 @@ from base_life.scraper import (
     setup_logging,
     unfiltered_items,
 )
-from main import format_news_item, normalize_url, publish_to_redis
+from canonical_msg import build_canonical, canonical, matched_keywords
+from main import normalize_url, publish_to_redis
 
 REDIS_BASE_CONF = {
     "host": "localhost",
     "port": 6379,
     "db": 0,
     "password": "",
-    "channel": "news",
 }
 
 ARCHIVE_URL = "file://tests/fixtures/archive_list.html"
@@ -32,6 +33,7 @@ SOURCE_CONFIG = {
         "title": "h1",
         "pub": "h6.dateline",
         "content": "div.article",
+        "search": ["Apple"],
     },
 }
 
@@ -39,6 +41,7 @@ SOURCE_CONFIG = {
 def _make_redis_conf() -> dict:
     conf = dict(REDIS_BASE_CONF)
     conf["dedup-set"] = f"base-life:test:{uuid.uuid4().hex[:8]}"
+    conf["canonical-channel"] = f"base-life:test:{uuid.uuid4().hex[:8]}"
     return conf
 
 
@@ -66,6 +69,26 @@ def _subscribe_messages(
     pubsub.unsubscribe(channel)
     pubsub.close()
     client.close()
+
+
+def _assert_canonical_fields(
+    msg: canonical.CanonicalMessage, item: NewsItem, matched: list[str]
+) -> None:
+    assert msg.id and len(msg.id) == 26, "id 应为 ULID 字符串"
+    assert msg.source.kind == canonical.SOURCE_KIND_CRAWLER
+    assert msg.source.id == f"base-life:{item.source}"
+    assert msg.source.display_name == item.source
+    assert msg.kind == canonical.MSG_KIND_NEWS
+    assert msg.dedup_key == f"base-life:{item.source}:{normalize_url(item.url)}"
+    assert msg.title == (item.title or "")
+    expected_body = (item.content or "").strip()
+    assert msg.body_markdown == expected_body
+    assert msg.body_text == expected_body
+    assert [(link.rel, link.url) for link in msg.links] == [
+        ("original", item.url)
+    ]
+    assert list(msg.tags) == matched
+    assert msg.HasField("published_at"), "published_at 永不为空"
 
 
 async def _fetch_list_and_details(max_items: int = 3) -> list[NewsItem]:
@@ -164,24 +187,90 @@ def test_normalize_url():
     print("\nnormalize_url 测试通过!")
 
 
-def test_fetch_and_format():
-    setup_logging("INFO")
-    items = asyncio.run(_fetch_list_and_details(max_items=3))
-    assert len(items) > 0, "应成功抓取至少一条详情页"
+def test_matched_keywords():
+    item = NewsItem(
+        source="test",
+        url="https://example.com/a",
+        title="Apple MacBook 新品发布",
+        content="",
+    )
+    selectors = {"search": ["apple", "MacBook", "apple"]}
+    assert matched_keywords(item, selectors) == ["apple", "MacBook"]
 
-    for item in items:
-        assert item.title is not None, "详情页应有标题"
-        assert item.content is not None, "详情页应有正文内容"
-        assert (
-            len(item.content) > 100
-        ), f"正文内容应超过 100 字符 (实际 {len(item.content)})"
+    item2 = NewsItem(
+        source="test",
+        url="https://example.com/b",
+        title="",
+        content="无关内容",
+    )
+    assert matched_keywords(item2, {"search": ["apple"]}) == []
 
-        md = format_news_item(item)
-        assert md.startswith("## "), "markdown 应以二级标题开头"
-        assert "**来源**: daringfireball" in md
-        assert "**链接**:" in md
+    assert matched_keywords(item, {}) == []
+    assert matched_keywords(item, None) == []
 
-    print(f"\n抓取+格式化测试通过! 抓取了 {len(items)} 条文章")
+    item3 = NewsItem(
+        source="test",
+        url="https://example.com/c",
+        title="Apple 发布会",
+        content="本文未提及 MacBook",
+    )
+    assert matched_keywords(item3, {"search": ["macbook", "苹果"]}) == ["macbook"]
+    print("\nmatched_keywords 测试通过!")
+
+
+def test_build_canonical():
+    item = NewsItem(
+        source="test_source",
+        url="https://example.com/article",
+        title="测试标题",
+        pub="2026-04-26T10:30:00",
+        content="这是正文内容。",
+        filtered=False,
+        filter_reason=None,
+    )
+    msg = build_canonical(item, ["kw1", "kw2"])
+    _assert_canonical_fields(msg, item, ["kw1", "kw2"])
+    assert msg.published_at.ToJsonString() == "2026-04-26T10:30:00Z"
+
+    item_no_pub = NewsItem(
+        source="test_source",
+        url="https://example.com/article2",
+        title="无日期新闻",
+        pub=None,
+        content="正文",
+        filtered=False,
+        filter_reason=None,
+    )
+    msg2 = build_canonical(item_no_pub, [])
+    _assert_canonical_fields(msg2, item_no_pub, [])
+    delta = time.time() - msg2.published_at.ToSeconds()
+    assert 0 <= delta < 10, "无 pub 时应填当前 UTC 时间"
+
+    item_bad_pub = NewsItem(
+        source="test_source",
+        url="https://example.com/article3",
+        title="坏日期",
+        pub="not-a-date",
+        content="正文",
+        filtered=False,
+        filter_reason=None,
+    )
+    msg3 = build_canonical(item_bad_pub, [])
+    delta3 = time.time() - msg3.published_at.ToSeconds()
+    assert 0 <= delta3 < 10, "pub 解析失败时应填当前 UTC 时间"
+
+    item_empty = NewsItem(
+        source="test_source",
+        url="https://example.com/article4",
+        title="空正文",
+        content="   ",
+        filtered=False,
+        filter_reason=None,
+    )
+    with pytest.raises(ValueError):
+        build_canonical(item_empty, [])
+
+    print("\nbuild_canonical 测试通过!")
 
 
 async def _test_dedup():
@@ -218,7 +307,7 @@ async def _test_dedup():
     )
 
     config = {"redis": redis_conf}
-    channel = redis_conf["channel"]
+    channel = redis_conf["canonical-channel"]
 
     received: list[bytes] = []
     stop_event = threading.Event()
@@ -266,6 +355,8 @@ async def _test_dedup():
     assert (
         len(received) == 3
     ), f"subscriber 应只收到 3 条 (实际 {len(received)})"
+    for raw in received:
+        canonical.CanonicalMessage.FromString(raw)
 
     client.delete(dedup_set)
     client.close()
@@ -284,7 +375,7 @@ async def _test_redis_publish_subscribe():
     dedup_set = redis_conf["dedup-set"]
     client = _redis_client(redis_conf)
 
-    channel = redis_conf["channel"]
+    channel = redis_conf["canonical-channel"]
     config = {"redis": redis_conf}
 
     fake_items = [
@@ -308,8 +399,6 @@ async def _test_redis_publish_subscribe():
         ),
     ]
 
-    expected_messages = [format_news_item(item) for item in fake_items]
-
     received: list[bytes] = []
     stop_event = threading.Event()
     sub_thread = threading.Thread(
@@ -332,14 +421,16 @@ async def _test_redis_publish_subscribe():
     ), f"接收数 {len(received)} != 发布数 {len(fake_items)}"
 
     for i, raw in enumerate(received):
-        decoded = raw.decode("utf-8")
-        assert decoded == expected_messages[i], f"第 {i} 条消息不一致"
+        msg = canonical.CanonicalMessage.FromString(raw)
+        _assert_canonical_fields(msg, fake_items[i], [])
+        assert msg.published_at.ToSeconds() > 0, "published_at 非空"
 
     client.delete(dedup_set)
     client.close()
 
     print(
-        f"\nRedis pub/sub 测试通过! 发布并接收了 {len(fake_items)} 条消息到 channel '{channel}'"
+        f"\nRedis pub/sub 测试通过! 发布并接收了 {len(fake_items)} 条 "
+        f"canonical 消息到 channel '{channel}'"
     )
 
 
@@ -353,8 +444,8 @@ async def _test_e2e_fetch_format_publish():
     client = _redis_client(redis_conf)
 
     setup_logging("INFO")
-    config = {"redis": redis_conf}
-    channel = redis_conf["channel"]
+    config = {"redis": redis_conf, "sources": [SOURCE_CONFIG]}
+    channel = redis_conf["canonical-channel"]
 
     items = await _fetch_list_and_details(max_items=3)
     _apply_search_filter(items, ["Apple"])
@@ -384,46 +475,20 @@ async def _test_e2e_fetch_format_publish():
     ), f"接收数 {len(received)} != 发布数 {len(matched)}"
 
     for i, raw in enumerate(received):
-        decoded = raw.decode("utf-8")
-        assert decoded == format_news_item(matched[i])
+        msg = canonical.CanonicalMessage.FromString(raw)
+        _assert_canonical_fields(
+            msg, matched[i], matched_keywords(matched[i], SOURCE_CONFIG["selectors"])
+        )
+        assert list(msg.tags) == ["Apple"], "tags 应含实际命中关键词"
 
     client.delete(dedup_set)
     client.close()
 
     print(
-        f"\n完整 E2E 测试通过! 抓取 {len(matched)} 条新闻 -> 去重 -> 格式化 -> 发布到 Redis '{channel}'"
+        f"\n完整 E2E 测试通过! 抓取 {len(matched)} 条新闻 -> 去重 -> 构造 "
+        f"canonical -> 发布到 Redis '{channel}'"
     )
 
 
 def test_e2e_fetch_format_publish():
     asyncio.run(_test_e2e_fetch_format_publish())
-
-
-def test_format_news_item():
-    item = NewsItem(
-        source="test_source",
-        url="https://example.com/article",
-        title="测试标题",
-        pub="2026-04-26T10:30:00",
-        content="这是正文内容。",
-        filtered=False,
-        filter_reason=None,
-    )
-    md = format_news_item(item)
-    assert md.startswith("## 测试标题")
-    assert "**来源**: test_source" in md
-    assert "**发布时间**: 2026-04-26T10:30:00" in md
-    assert "**链接**: https://example.com/article" in md
-    assert "这是正文内容。" in md
-
-    item_no_pub = NewsItem(
-        source="test_source",
-        url="https://example.com/article2",
-        title="无日期新闻",
-        pub=None,
-        content="正文",
-        filtered=False,
-        filter_reason=None,
-    )
-    md2 = format_news_item(item_no_pub)
-    assert "**发布时间**" not in md2
