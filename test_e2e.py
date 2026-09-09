@@ -1,5 +1,4 @@
 import asyncio
-import threading
 import time
 import uuid
 
@@ -41,7 +40,7 @@ SOURCE_CONFIG = {
 def _make_redis_conf() -> dict:
     conf = dict(REDIS_BASE_CONF)
     conf["dedup-set"] = f"base-life:test:{uuid.uuid4().hex[:8]}"
-    conf["canonical-channel"] = f"base-life:test:{uuid.uuid4().hex[:8]}"
+    conf["msgs_stream"] = f"base-life:test:{uuid.uuid4().hex[:8]}"
     return conf
 
 
@@ -54,21 +53,23 @@ def _redis_client(redis_conf: dict) -> redis.Redis:
     )
 
 
-def _subscribe_messages(
-    channel: str, redis_conf: dict, result: list, stop_event: threading.Event
-):
+def _xrange_messages(stream: str, redis_conf: dict) -> list[bytes]:
+    """读回断言：直接 XRANGE 取回 data field（生产消费归 push-core，测试简化）。
+
+    校验契约：entry 仅含 "data" 一个 field（与 streams-lib DATA_FIELD 一致）。
+    """
     client = _redis_client(redis_conf)
-    pubsub = client.pubsub()
-    pubsub.subscribe(channel)
-    while not stop_event.is_set():
-        msg = pubsub.get_message(timeout=1.0)
-        if msg and msg["type"] == "message":
-            result.append(msg["data"])
-        elif msg is None and not stop_event.is_set():
-            continue
-    pubsub.unsubscribe(channel)
-    pubsub.close()
-    client.close()
+    try:
+        entries = client.xrange(stream, min="-", max="+")
+        raws = []
+        for entry_id, fields in entries:
+            assert set(fields) == {b"data"}, (
+                f"entry {entry_id!r} 应只含 data field，实际 {set(fields)}"
+            )
+            raws.append(fields[b"data"])
+        return raws
+    finally:
+        client.close()
 
 
 def _assert_canonical_fields(
@@ -307,21 +308,15 @@ async def _test_dedup():
     )
 
     config = {"redis": redis_conf}
-    channel = redis_conf["canonical-channel"]
-
-    received: list[bytes] = []
-    stop_event = threading.Event()
-    sub_thread = threading.Thread(
-        target=_subscribe_messages,
-        args=(channel, redis_conf, received, stop_event),
-        daemon=True,
-    )
-    sub_thread.start()
-    time.sleep(1)
+    stream = redis_conf["msgs_stream"]
 
     count1 = await publish_to_redis(config, [item1, item2, item3])
     assert count1 == 3, f"首次发布应为 3 条 (实际 {count1})"
-    time.sleep(2)
+
+    raws = _xrange_messages(stream, redis_conf)
+    assert len(raws) == 3, f"XRANGE 应读到 3 条 (实际 {len(raws)})"
+    for raw in raws:
+        canonical.CanonicalMessage.FromString(raw)
 
     assert client.sismember(dedup_set, "https://example.com/article-1")
     assert client.sismember(dedup_set, "https://example.com/article-2")
@@ -347,18 +342,14 @@ async def _test_dedup():
     )
     count3 = await publish_to_redis(config, [item1_variant])
     assert count3 == 0, "带查询字符串的相同 URL 也应被去重"
-    time.sleep(1)
 
-    stop_event.set()
-    sub_thread.join(timeout=5)
-
+    raws_after = _xrange_messages(stream, redis_conf)
     assert (
-        len(received) == 3
-    ), f"subscriber 应只收到 3 条 (实际 {len(received)})"
-    for raw in received:
-        canonical.CanonicalMessage.FromString(raw)
+        len(raws_after) == 3
+    ), f"XRANGE 应仍只有 3 条 (实际 {len(raws_after)})"
 
     client.delete(dedup_set)
+    client.delete(stream)
     client.close()
 
     print(
@@ -370,12 +361,12 @@ def test_dedup():
     asyncio.run(_test_dedup())
 
 
-async def _test_redis_publish_subscribe():
+async def _test_stream_readback():
     redis_conf = _make_redis_conf()
     dedup_set = redis_conf["dedup-set"]
     client = _redis_client(redis_conf)
 
-    channel = redis_conf["canonical-channel"]
+    stream = redis_conf["msgs_stream"]
     config = {"redis": redis_conf}
 
     fake_items = [
@@ -399,43 +390,31 @@ async def _test_redis_publish_subscribe():
         ),
     ]
 
-    received: list[bytes] = []
-    stop_event = threading.Event()
-    sub_thread = threading.Thread(
-        target=_subscribe_messages,
-        args=(channel, redis_conf, received, stop_event),
-        daemon=True,
-    )
-    sub_thread.start()
-    time.sleep(1)
-
     count = await publish_to_redis(config, fake_items)
     assert count == len(fake_items)
 
-    time.sleep(3)
-    stop_event.set()
-    sub_thread.join(timeout=5)
-
-    assert len(received) == len(
+    raws = _xrange_messages(stream, redis_conf)
+    assert len(raws) == len(
         fake_items
-    ), f"接收数 {len(received)} != 发布数 {len(fake_items)}"
+    ), f"XRANGE 读数 {len(raws)} != 发布数 {len(fake_items)}"
 
-    for i, raw in enumerate(received):
+    for i, raw in enumerate(raws):
         msg = canonical.CanonicalMessage.FromString(raw)
         _assert_canonical_fields(msg, fake_items[i], [])
         assert msg.published_at.ToSeconds() > 0, "published_at 非空"
 
     client.delete(dedup_set)
+    client.delete(stream)
     client.close()
 
     print(
-        f"\nRedis pub/sub 测试通过! 发布并接收了 {len(fake_items)} 条 "
-        f"canonical 消息到 channel '{channel}'"
+        f"\nStream 读回测试通过! 发布并读回 {len(fake_items)} 条 "
+        f"canonical 消息到 stream '{stream}'"
     )
 
 
-def test_redis_publish_subscribe():
-    asyncio.run(_test_redis_publish_subscribe())
+def test_stream_readback():
+    asyncio.run(_test_stream_readback())
 
 
 async def _test_e2e_fetch_format_publish():
@@ -445,7 +424,7 @@ async def _test_e2e_fetch_format_publish():
 
     setup_logging("INFO")
     config = {"redis": redis_conf, "sources": [SOURCE_CONFIG]}
-    channel = redis_conf["canonical-channel"]
+    stream = redis_conf["msgs_stream"]
 
     items = await _fetch_list_and_details(max_items=3)
     _apply_search_filter(items, ["Apple"])
@@ -453,28 +432,15 @@ async def _test_e2e_fetch_format_publish():
 
     assert len(matched) > 0, "搜索 'Apple' 应有匹配结果"
 
-    received: list[bytes] = []
-    stop_event = threading.Event()
-    sub_thread = threading.Thread(
-        target=_subscribe_messages,
-        args=(channel, redis_conf, received, stop_event),
-        daemon=True,
-    )
-    sub_thread.start()
-    time.sleep(1)
-
     count = await publish_to_redis(config, matched)
     assert count == len(matched)
 
-    time.sleep(3)
-    stop_event.set()
-    sub_thread.join(timeout=5)
-
-    assert len(received) == len(
+    raws = _xrange_messages(stream, redis_conf)
+    assert len(raws) == len(
         matched
-    ), f"接收数 {len(received)} != 发布数 {len(matched)}"
+    ), f"XRANGE 读数 {len(raws)} != 发布数 {len(matched)}"
 
-    for i, raw in enumerate(received):
+    for i, raw in enumerate(raws):
         msg = canonical.CanonicalMessage.FromString(raw)
         _assert_canonical_fields(
             msg, matched[i], matched_keywords(matched[i], SOURCE_CONFIG["selectors"])
@@ -482,11 +448,12 @@ async def _test_e2e_fetch_format_publish():
         assert list(msg.tags) == ["Apple"], "tags 应含实际命中关键词"
 
     client.delete(dedup_set)
+    client.delete(stream)
     client.close()
 
     print(
         f"\n完整 E2E 测试通过! 抓取 {len(matched)} 条新闻 -> 去重 -> 构造 "
-        f"canonical -> 发布到 Redis '{channel}'"
+        f"canonical -> XADD 到 Redis Stream '{stream}'"
     )
 
 

@@ -49,12 +49,13 @@ async def publish_to_redis(config: dict, items: list) -> int:
     port = redis_conf.get("port", 6379)
     db = redis_conf.get("db", 0)
     password = redis_conf.get("password") or None
-    channel = redis_conf.get("canonical-channel", "msgs.in")
+    stream = redis_conf.get("msgs_stream", "stream:msgs:in")
     dedup_set = redis_conf.get("dedup-set", "base-life:published")
 
-    if redis_conf.get("channel"):
+    if redis_conf.get("channel") or redis_conf.get("canonical-channel"):
         logging.warning(
-            "redis.channel 已弃用且被忽略，发布目标为 canonical-channel"
+            "redis.channel / redis.canonical-channel 已弃用且被忽略，"
+            "发布目标为 msgs_stream（Redis Stream XADD）"
         )
 
     source_selectors = {
@@ -84,7 +85,9 @@ async def publish_to_redis(config: dict, items: list) -> int:
             except Exception:
                 logging.exception("canonical 构造失败，跳过该条: %s", item.url)
                 continue
-            pipe.publish(channel, msg.SerializeToString())
+            # "data" 字段名与 streams-lib DATA_FIELD 常量保持一致
+            # （契约见 push-architecture/streams-lib/src/publisher.rs）
+            pipe.xadd(stream, {"data": msg.SerializeToString()})
             pipe.sadd(dedup_set, normalize_url(item.url))
             count += 1
             logging.debug("canonical %s", protojson(msg))
@@ -117,7 +120,9 @@ async def run(config_path: str):
         return
 
     count = await publish_to_redis(config, matched)
-    logging.info("已发布 %d 条 canonical 消息到 Redis（去重后）。", count)
+    logging.info(
+        "已发布 %d 条 canonical 消息到 Redis Stream（去重后）。", count
+    )
 
 
 def main():

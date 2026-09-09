@@ -4,14 +4,14 @@
 [![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-基于 [base-life](https://github.com/NullOnSpace/base-life) 的新闻聚合与发布工具（消息推送分层架构的 **A 层**信源接入，总设计见 `~/rust-projects/push-architecture/DESIGN.md`）。从配置的新闻源抓取文章，按关键词过滤（D2：选题属 A），构造 [canonical-msg](~/rust-projects/push-architecture/canonical-msg) 仓库定义的 `push.v1` canonical 消息，通过 Redis Pub/Sub 发布到 `msgs.in`。
+基于 [base-life](https://github.com/NullOnSpace/base-life) 的新闻聚合与发布工具（消息推送分层架构的 **A 层**信源接入，总设计见 `~/rust-projects/push-architecture/DESIGN.md`）。从配置的新闻源抓取文章，按关键词过滤（D2：选题属 A），构造 [canonical-msg](~/rust-projects/push-architecture/canonical-msg) 仓库定义的 `push.v1` canonical 消息，通过 Redis Stream `XADD` 发布到 `stream:msgs:in`。
 
 ## 功能特性
 
 - **多源抓取**：支持配置多个新闻源，自动解析列表页和详情页
 - **关键词过滤**：按搜索词筛选匹配的文章（命中词写入 `tags`，可观测、可迁移）
 - **canonical 消息**：输出 push.v1 CanonicalMessage（protobuf bytes），不做终端格式化（Markdown 渲染移交 render-hub）
-- **Redis Pub/Sub 发布**：将 canonical 消息推送到 `msgs.in` 频道
+- **Redis Stream 发布**：将 canonical 消息 `XADD` 到 `stream:msgs:in`（entry 单 field `data`，契约见 streams-lib `DATA_FIELD`）
 - **URL 去重**：基于 Redis Set 的去重机制，**只记已发布 URL**，避免重复发布
 - **URL 标准化**：自动去除查询字符串、片段标识符和尾部斜杠
 
@@ -77,7 +77,7 @@ host = "localhost"           # Redis 服务器地址
 port = 6379                  # Redis 端口
 db = 0                       # Redis 数据库编号
 password = ""                # 密码（留空表示无密码）
-canonical-channel = "msgs.in"  # push.v1 canonical 消息发布目标（canonical-msg 契约）
+msgs_stream = "stream:msgs:in"  # push.v1 canonical 消息发布目标（XADD；field "data" 契约见 streams-lib）
 dedup-set = "base-life:published"  # 去重集合（只记已发布 URL）
 ```
 
@@ -123,16 +123,9 @@ search = ["MacBook Neo"]              # 搜索关键词（可选）
 
 `gen/` 的任何改动必须经 canonical-msg 的 `scripts/gen_python.sh` 再生成，禁止手改。
 
-## 订阅新闻
+## 读取新闻
 
-发布的载荷是 canonical 消息（protobuf bytes），可用 canonical-msg 的 `sub_dump` 观察工具查看（protojson，Timestamp 为 RFC3339）：
-
-```bash
-cd ~/rust-projects/push-architecture/canonical-msg
-cargo run --release --example sub_dump -- --channel msgs.in
-```
-
-或使用 Redis 客户端订阅并解码：
+发布的载荷是 canonical 消息（protobuf bytes），生产消费归 push-core（consumer group + pending 兜底）。本仓仅产出，读回验证用 Redis 客户端 `XRANGE` 并解码：
 
 ```python
 import sys
@@ -141,13 +134,9 @@ import redis
 from push.v1 import canonical_pb2
 
 client = redis.Redis(host="localhost", port=6379, db=0)
-pubsub = client.pubsub()
-pubsub.subscribe("msgs.in")
-
-for message in pubsub.listen():
-    if message["type"] == "message":
-        msg = canonical_pb2.CanonicalMessage.FromString(message["data"])
-        print(msg.title, msg.body_markdown)
+for _entry_id, fields in client.xrange("stream:msgs:in", min="-", max="+"):
+    msg = canonical_pb2.CanonicalMessage.FromString(fields[b"data"])
+    print(msg.title, msg.body_markdown)
 ```
 
 ## 开发
